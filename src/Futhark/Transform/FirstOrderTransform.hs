@@ -28,6 +28,8 @@ import Futhark.MonadFreshNames
 import Futhark.Tools
 import Futhark.Util (chunks, splitAt3)
 
+import Debug.Trace (trace)
+
 -- | The constraints that must hold for a lore in order to be the
 -- target of first-order transformation.
 type FirstOrderLore lore =
@@ -346,6 +348,63 @@ transformSOAC pat (Hist len ops bucket_fun imgs) = do
 
   -- Wrap up the above into a for-loop.
   letBind pat $ DoLoop [] merge (ForLoop iter Int64 len []) loopBody
+-- 1D stencils
+transformSOAC pat (Stencil [n] nbhSize [idxs] f [cs] [a]) = do
+  iter <- newVName "iter"
+  j <- newVName "j"
+
+  cs_t <- lookupType $ snd cs
+
+  a_t <- lookupType a
+  bs <- letExp "bs" $ BasicOp $ Scratch (elemType a_t) [n]
+
+  --a_out <- newIdent "stencil_out" a_t
+  --stencil_out_param <- newParam "stencil_out" $ toDecl a_t Unique
+  bs_t <- lookupType bs
+  bs_out <- newIdent "stencil_out" bs_t
+  -- stencil_out_param <- newParam "stencil_out" $ toDecl bs_t Unique
+
+  -- let merge = [(stencil_out_param, Var (identName a_out))]
+  let merge = loopMerge [bs_out] [Var bs]
+
+  idxs' <- letExp "idxs" $ BasicOp $ SubExp $ Var $ idxs
+
+  loopBody <- runBodyBinder $
+    localScope
+      (M.insert iter (IndexName Int64) $
+       scopeOfFParams $ map fst merge) $ do
+         xs <- letExp "xs" $ BasicOp $ Scratch (elemType a_t) [nbhSize]
+
+         xs_t <- lookupType xs
+         xs_out <- newIdent "idxs_out" xs_t
+         xs_out_param <- newParam "idxs_out" $ toDecl xs_t Unique
+
+         -- let innerMerge = [(xs_out_param, Var (identName xs_out))]
+         let innerMerge = loopMerge [xs_out] [Var xs]
+
+         innerLoopBody <- runBodyBinder $ localScope
+           (M.insert j (IndexName Int64) $ scopeOfFParams $ map fst innerMerge) $ do
+             
+             idx'  <- letExp "idx" $ BasicOp $ Index idxs' $ fullSlice xs_t [DimFix $ Var j]
+             idx'' <- letExp "idx" $ BasicOp $ BinOp (Add Int64 OverflowWrap) (Var iter) (Var idx')
+
+             idx_b1 <- letExp "idx" $ BasicOp $ BinOp (SMax Int64) (Var idx'')  (constant (0 :: Int64))
+             n1     <- letExp "idx_n1" $ BasicOp $ BinOp (Sub Int64 OverflowWrap) n (constant (1 :: Int64))
+             idx    <- letExp "idx" $ BasicOp $ BinOp (SMin Int64) (Var idx_b1) (Var n1)
+
+             val <- letExp "val" $ BasicOp $ Index a $ fullSlice a_t [DimFix $ Var idx]
+
+             write <- letExp "write" =<< eWriteArray (identName xs_out) [eSubExp $ Var j] (eSubExp $ Var val)
+
+             return $ resultBody [Var write]
+
+         xs' <- letExp "inner" $ DoLoop [] innerMerge (ForLoop j Int64 nbhSize []) innerLoopBody
+         c   <- letExp "const_val" $ BasicOp $ Index (snd cs) $ fullSlice cs_t [DimFix $ Var iter]
+         val <- head <$> bindLambda f [BasicOp . SubExp . Var $ c, BasicOp . SubExp . Var $ xs']
+         write <- letExp "write" =<< eWriteArray (identName bs_out) [eSubExp $ Var iter] (eSubExp val)
+         return $ resultBody $ [Var write]
+  
+  letBind pat $ DoLoop [] merge (ForLoop iter Int64 n []) loopBody
 
 -- | Recursively first-order-transform a lambda.
 transformLambda ::
